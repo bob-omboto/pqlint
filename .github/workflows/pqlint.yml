@@ -1,17 +1,38 @@
-name: PQLint TMDL Analysis
+name: Power Query Lint TMDL Analysis
 
 on:
   push:
     branches:
-      - main
+      - '*'
     paths:
       - '**/*.tmdl'
   pull_request:
     branches:
-      - main
-      - develop
+      - '*'
     paths:
       - '**/*.tmdl'
+  workflow_dispatch:
+    inputs:
+      semantic_model_filter:
+        description: 'Filter semantic models (leave empty for all, or specify pattern like "Model1*")'
+        required: false
+        default: ''
+      severity_filter:
+        description: 'Minimum severity level to report (1=Info, 2=Warning, 3=Error)'
+        required: false
+        default: '1'
+        type: choice
+        options:
+        - '1'
+        - '2'
+        - '3'
+
+# Security: Explicitly define permissions
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+  pull-requests: write
 
 env:
   # These will be dynamically set based on discovered *.SemanticModel folders
@@ -22,22 +43,58 @@ jobs:
   tmdl-linting:
     name: TMDL Code Linting
     runs-on: ubuntu-latest
+    # Best Practice: Add timeout to prevent runaway jobs
+    timeout-minutes: 30
+    # Add workflow outputs for summary
+    outputs:
+      total-issues: ${{ steps.generate-summary.outputs.total-issues }}
+      has-errors: ${{ steps.generate-summary.outputs.has-errors }}
+      models-processed: ${{ steps.generate-summary.outputs.models-processed }}
+      files-analyzed: ${{ steps.generate-summary.outputs.files-analyzed }}
+      error-count: ${{ steps.generate-summary.outputs.error-count }}
+      warning-count: ${{ steps.generate-summary.outputs.warning-count }}
+      info-count: ${{ steps.generate-summary.outputs.info-count }}
     env:
       PQLINT_SUBSCRIPTION_KEY: ${{ secrets.PQLINT_SUBSCRIPTION_KEY }}
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
+        with:
+          # Best Practice: Only fetch what's needed
+          fetch-depth: 1
+          # Best Practice: Persist credentials for potential follow-up actions
+          persist-credentials: false
 
-      - name: Define PQLintAPI Functions and then Lint code
+      # Best Practice: Cache PowerShell modules
+      - name: Cache PowerShell modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/powershell/Modules
+          key: ${{ runner.os }}-powershell-modules-${{ hashFiles('**/*.ps1') }}
+          restore-keys: |
+            ${{ runner.os }}-powershell-modules-
+
+      # Best Practice: Validate required secrets early
+      - name: Validate required secrets
         shell: pwsh
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:PQLINT_SUBSCRIPTION_KEY)) {
+              Write-Error "PQLINT_SUBSCRIPTION_KEY secret is not configured"
+              exit 1
+          }
+          Write-Host "✅ Required secrets are configured"
+
+      - name: Setup Power Query Lint Functions
+        shell: pwsh
+        run: |
+          # Create PowerShell module for Power Query Lint functions
+          $moduleDir = "pqlint-module"
+          New-Item -ItemType Directory -Path $moduleDir -Force | Out-Null
+          
+          $functionContent = @'
           # API Configuration
           $script:ApiBaseUrl = "https://api.pqlint.com/v1"
           
-          # PQLint API PowerShell Functions
-          # Provides functions to interface with the PQLint API for linting Power Query M code and TMDL code
-
-          # Helper function to make HTTP requests with proper error handling
           function Invoke-PQLintApiRequest {
               [CmdletBinding()]
               param(
@@ -73,89 +130,23 @@ jobs:
                       }
                   }
                   
-                  $response = Invoke-RestMethod @requestParams
-                  return $response
+                  return Invoke-RestMethod @requestParams
               }
               catch {
                   $errorDetails = $_.Exception.Message
                   if ($_.Exception.Response) {
                       $statusCode = $_.Exception.Response.StatusCode
                       $statusDescription = $_.Exception.Response.StatusDescription
-                      
-                      try {
-                          $errorStream = $_.Exception.Response.GetResponseStream()
-                          $reader = New-Object System.IO.StreamReader($errorStream)
-                          $errorBody = $reader.ReadToEnd()
-                          $reader.Close()
-                          
-                          if ($errorBody) {
-                              $errorObject = $errorBody | ConvertFrom-Json
-                              $errorDetails = "HTTP $([int]$statusCode) $statusDescription - $($errorObject.body)"
-                          }
-                      }
-                      catch {
-                          $errorDetails = "HTTP $([int]$statusCode) $statusDescription - $errorDetails"
-                      }
+                      $errorDetails = "HTTP $([int]$statusCode) $statusDescription - $errorDetails"
                   }
-                  
-                  throw "PQLint API Error: $errorDetails"
+                  throw "Power Query Lint API Error: $errorDetails"
               }
           }
-
-          <#
-          .SYNOPSIS
-              Lints Power Query M code or TMDL code using the PQLint API.
-
-          .DESCRIPTION
-              This function sends code to the PQLint API for analysis and returns linting results.
-              Supports both Power Query M code and TMDL code with configurable options.
-
-          .PARAMETER Code
-              The multiline Power Query M code or TMDL code to lint. This parameter is mandatory.
-
-          .PARAMETER SubscriptionKey
-              The subscription key for API authorization. This parameter is mandatory.
-
-          .PARAMETER Rules
-              Optional array of rule IDs to apply. If not specified, all applicable rules will be used.
-
-          .PARAMETER Severity
-              Optional minimum severity level to include in results. 
-              For example: "3" for potential issues, "2" for best practices.
-
-          .PARAMETER Format
-              Optional format type. Either "pq" for Power Query M code or "tmdl" for TMDL code.
-              If not specified, defaults to "pq".
-
-          .EXAMPLE
-              Invoke-CodeLinting -Code $myCode -SubscriptionKey "your-key-here"
-              
-              Lints the provided code using default settings.
-
-          .EXAMPLE
-              Invoke-CodeLinting -Code $myCode -SubscriptionKey "your-key-here" -Format "tmdl" -Severity "2"
-              
-              Lints TMDL code with minimum severity level of 2 (best practices).
-
-          .EXAMPLE
-              $rules = @("rule1", "rule2")
-              Invoke-CodeLinting -Code $myCode -SubscriptionKey "your-key-here" -Rules $rules
-              
-              Lints code using only the specified rules.
-
-          .OUTPUTS
-              Array of PSCustomObject representing rule results with properties:
-              - ID: Rule identifier
-              - Name: Rule name
-              - Category: Rule category
-              - Description: Rule description
-              - Severity: Rule severity level
-              - ErrorInformation: Object containing error location and file path details
-          #>
+          
           function Invoke-CodeLinting {
               [CmdletBinding()]
               param(
-                  [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+                  [Parameter(Mandatory = $true)]
                   [string]$Code,
                   
                   [Parameter(Mandatory = $true)]
@@ -172,235 +163,533 @@ jobs:
                   [string]$Format = "pq"
               )
               
-              Write-Verbose "Linting code using PQLint API with format: $Format"
-              
-              if ([string]::IsNullOrWhiteSpace($Code)) {
-                  throw "Code parameter cannot be null or empty"
+              if ([string]::IsNullOrWhiteSpace($Code) -or [string]::IsNullOrWhiteSpace($SubscriptionKey)) {
+                  throw "Code and SubscriptionKey parameters are required"
               }
               
-              if ([string]::IsNullOrWhiteSpace($SubscriptionKey)) {
-                  throw "SubscriptionKey parameter cannot be null or empty"
-              }
-              
-              # Build the request body
-              $requestBody = @{
-                  code = $Code
-              }
-              
-              # Add optional parameters
-              if ($Rules -and $Rules.Count -gt 0) {
-                  $requestBody.rules = $Rules
-              }
+              $requestBody = @{ code = $Code }
+              if ($Rules -and $Rules.Count -gt 0) { $requestBody.rules = $Rules }
               
               $options = @{}
-              if (![string]::IsNullOrWhiteSpace($Severity)) {
-                  $options.severity = $Severity
-              }
-              if (![string]::IsNullOrWhiteSpace($Format)) {
-                  $options.format = $Format
-              }
+              if (![string]::IsNullOrWhiteSpace($Severity)) { $options.severity = $Severity }
+              if (![string]::IsNullOrWhiteSpace($Format)) { $options.format = $Format }
+              if ($options.Count -gt 0) { $requestBody.options = $options }
               
-              if ($options.Count -gt 0) {
-                  $requestBody.options = $options
-              }
-              
-              # Build the URI with subscription key
               $uri = "$script:ApiBaseUrl/pq/lint?subscription-key=$([System.Web.HttpUtility]::UrlEncode($SubscriptionKey))"
-              try {
-                  $results = Invoke-PQLintApiRequest -Uri $uri -Method 'POST' -Body $requestBody -Verbose
-                  
-                  Write-Verbose "Successfully completed linting. Found $($results.Count) issues."
-                  return $results
-              }
-              catch {
-                  Write-Error "Failed to lint code: $($_.Exception.Message)"
-                  throw
-              }
+              return Invoke-PQLintApiRequest -Uri $uri -Method 'POST' -Body $requestBody
           }
+          
+          function Write-GitHubLog {
+              param([Parameter(Mandatory = $true)][string]$Message, [string]$Level = "notice")
+              Write-Host "::$Level::$Message"
+          }
+          '@
+          
+          $functionContent | Out-File -FilePath "$moduleDir/PQLintFunctions.ps1" -Encoding UTF8
 
-          # Set error action preference
-          $ErrorActionPreference = "Stop"
+      - name: Discover Semantic Models
+        id: discover-models
+        shell: pwsh
+        run: |
+          $semanticModelFilter = "${{ github.event.inputs.semantic_model_filter }}"
           
-          # Get subscription key from environment variable
-          $subscriptionKey = $env:PQLINT_SUBSCRIPTION_KEY
-          if ([string]::IsNullOrWhiteSpace($subscriptionKey)) {
-              throw "PQLINT_SUBSCRIPTION_KEY environment variable is not set or is empty"
-          }
-          
-          # Discover all *.SemanticModel folders in the repository
           Write-Host "Discovering *.SemanticModel folders..."
-          $semanticModelFolders = Get-ChildItem -Path "." -Directory -Filter "*.SemanticModel" -Recurse
+          $allSemanticModelFolders = Get-ChildItem -Path "." -Directory -Filter "*.SemanticModel" -Recurse
+          
+          if (![string]::IsNullOrWhiteSpace($semanticModelFilter)) {
+              $semanticModelFolders = $allSemanticModelFolders | Where-Object { $_.Name -like $semanticModelFilter }
+              Write-Host "Filtered to $($semanticModelFolders.Count) semantic model(s) matching pattern '$semanticModelFilter'"
+          } else {
+              $semanticModelFolders = $allSemanticModelFolders
+          }
           
           if ($semanticModelFolders.Count -eq 0) {
-              Write-Host "No *.SemanticModel folders found in the repository"
+              Write-Host "No *.SemanticModel folders found"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "models-found=0"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "model-names=[]"
+          } else {
+              $modelNames = $semanticModelFolders | ForEach-Object { $_.Name }
+              $modelNamesJson = $modelNames | ConvertTo-Json -Compress
+              
+              Write-Host "Found $($semanticModelFolders.Count) *.SemanticModel folder(s):"
+              $modelNames | ForEach-Object { Write-Host "  - $_" }
+              
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "models-found=$($semanticModelFolders.Count)"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "model-names=$modelNamesJson"
+          }
+
+      - name: Run Power Query Lint Analysis
+        id: run-analysis
+        env:
+          MODELS_FOUND: ${{ steps.discover-models.outputs.models-found }}
+          MODEL_NAMES_JSON: ${{ steps.discover-models.outputs.model-names }}
+        shell: pwsh
+        run: |
+          Write-Host "=== DEBUG INFORMATION ==="
+          Write-Host "Models found: $env:MODELS_FOUND"
+          Write-Host "Model names: $env:MODEL_NAMES_JSON"
+          Write-Host "=========================="
+          
+          # Load Power Query Lint functions
+          . "./pqlint-module/PQLintFunctions.ps1"
+          
+          $ErrorActionPreference = "Stop"
+          $subscriptionKey = $env:PQLINT_SUBSCRIPTION_KEY
+          $severityFilter = "${{ github.event.inputs.severity_filter }}"
+          if ([string]::IsNullOrWhiteSpace($severityFilter)) { $severityFilter = "1" }
+          
+          # Get model names from previous step
+          $modelNamesJson = $env:MODEL_NAMES_JSON
+          Write-Host "Model names JSON from previous step: $modelNamesJson"
+          
+          # Handle empty or null JSON
+          if ([string]::IsNullOrWhiteSpace($modelNamesJson) -or $modelNamesJson -eq '[]' -or $modelNamesJson -eq 'null') {
+              Write-Warning "No model names found from previous step"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "total-issues=0"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "has-potential-issues=False"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "files-analyzed=0"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "models-processed=0"
               exit 0
           }
           
-          Write-Host "Found $($semanticModelFolders.Count) *.SemanticModel folder(s):"
-          foreach ($folder in $semanticModelFolders) {
-              Write-Host "  - $($folder.FullName)"
+          try {
+              $modelNames = $modelNamesJson | ConvertFrom-Json
+              if (-not $modelNames -or $modelNames.Count -eq 0) {
+                  Write-Warning "Model names array is empty after parsing"
+                  Add-Content -Path $env:GITHUB_OUTPUT -Value "total-issues=0"
+                  Add-Content -Path $env:GITHUB_OUTPUT -Value "has-potential-issues=False"
+                  Add-Content -Path $env:GITHUB_OUTPUT -Value "files-analyzed=0"
+                  Add-Content -Path $env:GITHUB_OUTPUT -Value "models-processed=0"
+                  exit 0
+              }
+              
+              Write-Host "Successfully parsed $($modelNames.Count) model names:"
+              $modelNames | ForEach-Object { Write-Host "  - $_" }
+          }
+          catch {
+              Write-Error "Failed to parse model names JSON: $($_.Exception.Message)"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "total-issues=0"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "has-potential-issues=True"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "files-analyzed=0"
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "models-processed=0"
+              exit 1
           }
           
-          # Initialize counters and results for all semantic models
-          $totalIssues = 0
-          $allResults = @()
-          $hasErrors = $false
-          $totalFilesAnalyzed = 0
+          # Initialize counters
+          $totalIssues = 0; $hasPotentialIssues = $false; $totalFilesAnalyzed = 0; $allResults = @()
           
-          # Process each *.SemanticModel folder
-          foreach ($semanticModelFolder in $semanticModelFolders) {
-              Write-Host ""
-              Write-Host "================================================="
-              Write-Host "Processing Semantic Model: $($semanticModelFolder.Name)"
-              Write-Host "================================================="
+          # Create results directory
+          $resultsDir = "pqlint-results"
+          New-Item -ItemType Directory -Path $resultsDir -Force | Out-Null
+          
+          foreach ($modelName in $modelNames) {
+              Write-Host "::group::Processing $modelName"
               
-              # Define paths for this semantic model
-              $tablesDirectory = Join-Path $semanticModelFolder.FullName "definition\tables"
-              $definitionDirectory = Join-Path $semanticModelFolder.FullName "definition"
-              
-              Write-Host "Tables directory: $tablesDirectory"
-              Write-Host "Definition directory: $definitionDirectory"
-              
-              # Collect TMDL files for this semantic model
-              $tmdlFiles = @()
-              
-              # Add table definition files if tables directory exists
-              if (Test-Path $tablesDirectory) {
-                  $tableFiles = Get-ChildItem -Path $tablesDirectory -Filter "*.tmdl" -File
-                  if ($tableFiles.Count -gt 0) {
-                      $tmdlFiles += $tableFiles
-                      Write-Host "Found $($tableFiles.Count) table definition files"
-                  }
-              } else {
-                  Write-Warning "Tables directory not found: $tablesDirectory"
-              }
-              
-              # Add expressions.tmdl file if it exists
-              $expressionsFile = Join-Path $definitionDirectory "expressions.tmdl"
-              if (Test-Path $expressionsFile) {
-                  $tmdlFiles += Get-Item $expressionsFile
-                  Write-Host "Added expressions.tmdl to analysis list"
-              } else {
-                  Write-Warning "expressions.tmdl not found at: $expressionsFile"
-              }
-              
-              if ($tmdlFiles.Count -eq 0) {
-                  Write-Warning "No .tmdl files found in semantic model: $($semanticModelFolder.Name)"
+              $semanticModelFolder = Get-ChildItem -Path "." -Directory -Filter $modelName -Recurse | Select-Object -First 1
+              if (-not $semanticModelFolder) {
+                  Write-Warning "Could not find semantic model folder: $modelName"
+                  Write-Host "::endgroup::"
                   continue
               }
               
-              Write-Host "Found $($tmdlFiles.Count) TMDL files to analyze in $($semanticModelFolder.Name)"
+              $tablesDirectory = Join-Path $semanticModelFolder.FullName "definition\tables"
+              $definitionDirectory = Join-Path $semanticModelFolder.FullName "definition"
+              
+              # Collect TMDL files
+              $tmdlFiles = @()
+              
+              # Add table files
+              if (Test-Path $tablesDirectory) {
+                  $tableFiles = Get-ChildItem -Path $tablesDirectory -Filter "*.tmdl" -File
+                  if ($tableFiles) { $tmdlFiles += $tableFiles }
+              }
+              
+              # Add definition files (expressions, database, model, relationships)
+              $definitionFiles = @("expressions.tmdl", "database.tmdl", "model.tmdl", "relationships.tmdl")
+              foreach ($fileName in $definitionFiles) {
+                  $filePath = Join-Path $definitionDirectory $fileName
+                  if (Test-Path $filePath) {
+                      $tmdlFiles += Get-Item $filePath
+                  }
+              }
+              
+              if ($tmdlFiles.Count -eq 0) {
+                  Write-Warning "No .tmdl files found in semantic model: $modelName"
+                  Write-Host "::endgroup::"
+                  continue
+              }
+              
+              Write-Host "Found $($tmdlFiles.Count) TMDL files to analyze"
               $totalFilesAnalyzed += $tmdlFiles.Count
-          
-              # Process each TMDL file in this semantic model
+              
+              # Combine files and create content map
+              $combinedContent = ""; $fileContentMap = @{}; $currentLineNumber = 1
+              
               foreach ($file in $tmdlFiles) {
-                  Write-Host ""
-                  Write-Host "----------------------------------------"
-                  Write-Host "Analyzing file: $($file.Name) (from $($semanticModelFolder.Name))"
-                  Write-Host "----------------------------------------"
-                  
                   try {
-                      # Read the file content
                       $fileContent = Get-Content -Path $file.FullName -Raw -Encoding UTF8
+                      if ([string]::IsNullOrWhiteSpace($fileContent)) { continue }
                       
-                      if ([string]::IsNullOrWhiteSpace($fileContent)) {
-                          Write-Warning "File $($file.Name) is empty, skipping..."
-                          continue
+                      $contentLines = $fileContent -split "`n"
+                      $fileContentMap[$file.Name] = @{
+                          StartLine = $currentLineNumber
+                          EndLine = $currentLineNumber + $contentLines.Count - 1
+                          SemanticModel = $modelName
                       }
                       
-                      # Run PQLint analysis
-                      Write-Host "Running PQLint analysis on $($file.Name)..."
-                      $results = Invoke-CodeLinting -Code $fileContent -SubscriptionKey $subscriptionKey -Format "tmdl"
-                      
-                      if ($results -and $results.Count -gt 0) {
-                          Write-Host "Found $($results.Count) issues in $($file.Name):"
-                          
-                          foreach ($result in $results) {
-                              $severityColor = switch ($result.Severity) {
-                                  3 { "Red" }      # Error
-                                  2 { "Yellow" }   # Warning
-                                  1 { "Cyan" }     # Info
-                                  default { "White" }
-                              }
-                              
-                              $severityText = switch ($result.Severity) {
-                                  3 { "ERROR" }
-                                  2 { "WARNING" }
-                                  1 { "INFO" }
-                                  default { "UNKNOWN" }
-                              }
-                              
-                              Write-Host "  [$severityText] $($result.Name)" -ForegroundColor $severityColor
-                              Write-Host "    Rule ID: $($result.ID)"
-                              Write-Host "    Category: $($result.Category)"
-                              Write-Host "    Description: $($result.Description)"
-                              
-                              if ($result.ErrorInformation) {
-                                  Write-Host "    Location: Line $($result.ErrorInformation.errorLocation.positionStart.lineNumber)"
-                              }
-                              
-                              Write-Host ""
-                              
-                              # Track errors for workflow failure
-                              if ($result.Severity -eq 3) {
-                                  $hasErrors = $true
-                              }
-                          }
-                          
-                          $totalIssues += $results.Count
-                          $allResults += $results | ForEach-Object { 
-                              $_ | Add-Member -NotePropertyName "FileName" -NotePropertyValue $file.Name -PassThru |
-                              Add-Member -NotePropertyName "SemanticModel" -NotePropertyValue $semanticModelFolder.Name -PassThru
-                          }
-                      } else {
-                          Write-Host "✅ No issues found in $($file.Name)" -ForegroundColor Green
-                      }
+                      $combinedContent += "// FILE: $($file.Name) (from $modelName)`n$fileContent`n`n"
+                      $currentLineNumber += $contentLines.Count + 2
                   }
                   catch {
-                      Write-Error "Failed to analyze $($file.Name): $($_.Exception.Message)"
-                      $hasErrors = $true
+                      Write-Warning "Failed to read file $($file.Name): $($_.Exception.Message)"
+                  }
+              }
+              
+              if ([string]::IsNullOrWhiteSpace($combinedContent)) {
+                  Write-Warning "No valid content found in semantic model: $modelName"
+                  Write-Host "::endgroup::"
+                  continue
+              }
+              
+              # Save combined content to artifacts for reference
+              $sanitizedModelName = $modelName -replace '[\\/:*?"<>|]', '_'
+              $combinedContentPath = Join-Path $resultsDir "$sanitizedModelName-combined.txt"
+              $combinedContent | Out-File -FilePath $combinedContentPath -Encoding UTF8
+              Write-Host "Combined Power Query content saved to: $combinedContentPath"
+              
+              # Run linting
+              try {
+                  Write-Host "Running Power Query Lint analysis on $($combinedContent.Length) characters of combined content..."
+                  $results = Invoke-CodeLinting -Code $combinedContent -SubscriptionKey $subscriptionKey -Format "tmdl" -Severity $severityFilter
+                  
+                  if ($results -and $results.Count -gt 0) {
+                      Write-Host "Found $($results.Count) issues in $modelName"
+                      
+                      foreach ($result in $results) {
+                          $lineNumber = 1
+                          if ($result.ErrorInformation -and $result.ErrorInformation.errorLocation -and $result.ErrorInformation.errorLocation.positionStart) {
+                              $lineNumber = $result.ErrorInformation.errorLocation.positionStart.lineNumber
+                          }
+                          
+                          # Find file from line number
+                          $fileInfo = @{ FileName = "Unknown"; SemanticModel = $modelName; RelativeLine = $lineNumber }
+                          foreach ($fileName in $fileContentMap.Keys) {
+                              $info = $fileContentMap[$fileName]
+                              if ($lineNumber -ge $info.StartLine -and $lineNumber -le $info.EndLine) {
+                                  $fileInfo = @{
+                                      FileName = $fileName
+                                      SemanticModel = $info.SemanticModel
+                                      RelativeLine = $lineNumber - $info.StartLine + 1
+                                  }
+                                  break
+                              }
+                          }
+                          
+                          # Add file info to result
+                          $result | Add-Member -NotePropertyName "FileName" -NotePropertyValue $fileInfo.FileName -Force
+                          $result | Add-Member -NotePropertyName "SemanticModel" -NotePropertyValue $fileInfo.SemanticModel -Force
+                          $result | Add-Member -NotePropertyName "RelativeLineNumber" -NotePropertyValue $fileInfo.RelativeLine -Force
+                          
+                          if ($result.Severity -eq 3) { $hasPotentialIssues = $true }
+                      }
+                      
+                      $totalIssues += $results.Count
+                      $allResults += $results
+                  } else {
+                      Write-Host "✅ No issues found in $modelName" -ForegroundColor Green
+                  }
+              }
+              catch {
+                  Write-Error "Failed to analyze model '$modelName'. Error: $($_.Exception.Message)"
+                  $hasPotentialIssues = $true
+              }
+              
+              Write-Host "::endgroup::"
+          }
+          
+          # Export results
+          if ($allResults.Count -gt 0) {
+              $resultsJson = $allResults | ConvertTo-Json -Depth 10
+              $resultsPath = Join-Path $resultsDir "pqlint-results.json"
+              $resultsJson | Out-File -FilePath $resultsPath -Encoding UTF8
+              Write-Host "Results exported to: $resultsPath"
+          } else {
+              # Create empty results file for consistency
+              "[]" | Out-File -FilePath (Join-Path $resultsDir "pqlint-results.json") -Encoding UTF8
+              Write-Host "No results to export - created empty results file"
+          }
+          
+          # Set outputs for summary step
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "total-issues=$totalIssues"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "has-potential-issues=$hasPotentialIssues"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "files-analyzed=$totalFilesAnalyzed"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "models-processed=$($modelNames.Count)"
+
+      - name: Debug Step Outputs
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "=== ALL STEP OUTPUTS DEBUG ==="
+          Write-Host "discover-models.outputs.models-found: '${{ steps.discover-models.outputs.models-found }}'"
+          Write-Host "discover-models.outputs.model-names: '${{ steps.discover-models.outputs.model-names }}'"
+          Write-Host "run-analysis.outputs.total-issues: '${{ steps.run-analysis.outputs.total-issues }}'"
+          Write-Host "run-analysis.outputs.has-potential-issues: '${{ steps.run-analysis.outputs.has-potential-issues }}'"
+          Write-Host "run-analysis.outputs.files-analyzed: '${{ steps.run-analysis.outputs.files-analyzed }}'"
+          Write-Host "run-analysis.outputs.models-processed: '${{ steps.run-analysis.outputs.models-processed }}'"
+          Write-Host "==============================="
+
+      - name: Generate Summary and Annotations
+        id: generate-summary
+        if: always()
+        shell: pwsh
+        run: |
+          # Initialize default values
+          $totalIssues = 0; $potentialIssuesCount = 0; $bestPracticesCount = 0; $infoCount = 0; $hasPotentialIssues = $false
+          $totalFilesAnalyzed = 0; $modelsProcessed = 0; $allResults = @()
+          
+          # Get values from previous steps
+          $modelsFound = '${{ steps.discover-models.outputs.models-found }}'
+          Write-Host "Models found from discovery step: $modelsFound"
+          
+          # Check which analysis step ran
+          $mainAnalysisRan = '${{ steps.run-analysis.conclusion }}' -ne 'skipped'
+          Write-Host "Main analysis step ran: $mainAnalysisRan"
+          
+          if ($modelsFound -and $modelsFound -ne '0' -and $modelsFound -ne '') {
+              if ($mainAnalysisRan) {
+                  $analysisTotal = '${{ steps.run-analysis.outputs.total-issues }}'
+                  $analysisPotentialIssues = '${{ steps.run-analysis.outputs.has-potential-issues }}'
+                  $analysisFiles = '${{ steps.run-analysis.outputs.files-analyzed }}'
+                  $analysisModels = '${{ steps.run-analysis.outputs.models-processed }}'
+                  Write-Host "Using main analysis outputs"
+              } else {
+                  Write-Warning "Analysis step was skipped despite models being found"
+                  $analysisTotal = "0"
+                  $analysisPotentialIssues = "False"
+                  $analysisFiles = "0"
+                  $analysisModels = $modelsFound
+              }
+              
+              Write-Host "Analysis step outputs - Total: $analysisTotal, Potential Issues: $analysisPotentialIssues, Files: $analysisFiles, Models: $analysisModels"
+              
+              # Use analysis outputs if available, otherwise use defaults
+              if (![string]::IsNullOrWhiteSpace($analysisFiles)) { $totalFilesAnalyzed = [int]$analysisFiles }
+              if (![string]::IsNullOrWhiteSpace($analysisModels)) { $modelsProcessed = [int]$analysisModels }
+              if (![string]::IsNullOrWhiteSpace($analysisTotal)) { $totalIssues = [int]$analysisTotal }
+              if (![string]::IsNullOrWhiteSpace($analysisPotentialIssues)) { $hasPotentialIssues = [bool]::Parse($analysisPotentialIssues) }
+              
+              # Load results if they exist
+              $resultsPath = "pqlint-results/pqlint-results.json"
+              if (Test-Path $resultsPath) {
+                  $resultsContent = Get-Content $resultsPath -Raw
+                  Write-Host "Results file content preview: $($resultsContent.Substring(0, [Math]::Min(100, $resultsContent.Length)))..."
+                  
+                  if (![string]::IsNullOrWhiteSpace($resultsContent) -and $resultsContent.Trim() -ne '[]') {
+                      try {
+                          $allResults = $resultsContent | ConvertFrom-Json
+                          if ($allResults -and $allResults.Count -gt 0) {
+                              $totalIssues = $allResults.Count
+                              $potentialIssuesCount = ($allResults | Where-Object { $_.Severity -eq 3 }).Count
+                              $bestPracticesCount = ($allResults | Where-Object { $_.Severity -eq 2 }).Count
+                              $infoCount = ($allResults | Where-Object { $_.Severity -eq 1 }).Count
+                              $hasPotentialIssues = $potentialIssuesCount -gt 0
+                              Write-Host "Successfully loaded $($allResults.Count) results from JSON"
+                          }
+                      }
+                      catch {
+                          Write-Warning "Failed to parse results JSON: $($_.Exception.Message)"
+                      }
+                  } else {
+                      Write-Host "Results file is empty or contains empty array"
+                  }
+              } else {
+                  Write-Warning "Results file not found at: $resultsPath"
+              }
+          } else {
+              Write-Host "No models were found in discovery step, using default values"
+          }
+          
+          Write-Host "========================================="
+          Write-Host "ANALYSIS SUMMARY"
+          Write-Host "========================================="
+          Write-Host "Semantic models processed: $modelsProcessed"
+          Write-Host "Files analyzed: $totalFilesAnalyzed"
+          Write-Host "Total issues found: $totalIssues"
+          Write-Host "  - Potential Issues: $potentialIssuesCount"
+          Write-Host "  - Best Practices: $bestPracticesCount"
+          Write-Host "  - Info: $infoCount"
+          
+          # Create GitHub annotations
+          if ($allResults -and $allResults.Count -gt 0) {
+              foreach ($result in $allResults) {
+                  $annotationType = switch ($result.Severity) {
+                      3 { "error" }; 2 { "warning" }; 1 { "notice" }; default { "notice" }
+                  }
+                  $message = "$($result.Name): $($result.Description)"
+                  if ($result.FileName -and $result.RelativeLineNumber) {
+                      Write-Host "::$annotationType file=$($result.FileName),line=$($result.RelativeLineNumber)::$message"
+                  } else {
+                      Write-Host "::$annotationType::$message"
                   }
               }
           }
           
-          # Summary
-          Write-Host ""
-          Write-Host "========================================="
-          Write-Host "ANALYSIS SUMMARY"
-          Write-Host "========================================="
-          Write-Host "Semantic models processed: $($semanticModelFolders.Count)"
-          Write-Host "Files analyzed: $totalFilesAnalyzed"
-          Write-Host "Total issues found: $totalIssues"
+          # Generate summary report
+          $summaryDir = "pqlint-results"
+          New-Item -ItemType Directory -Path $summaryDir -Force | Out-Null
           
-          if ($totalIssues -gt 0) {
-              $errorCount = ($allResults | Where-Object { $_.Severity -eq 3 }).Count
-              $warningCount = ($allResults | Where-Object { $_.Severity -eq 2 }).Count
-              $infoCount = ($allResults | Where-Object { $_.Severity -eq 1 }).Count
+          $summaryContent = if ($totalIssues -gt 0) {
+              $issuesByModel = $allResults | Group-Object -Property SemanticModel
+              $modelBreakdown = ($issuesByModel | ForEach-Object {
+                  $mPotentialIssues = ($_.Group | Where-Object { $_.Severity -eq 3 }).Count
+                  $mBestPractices = ($_.Group | Where-Object { $_.Severity -eq 2 }).Count
+                  $mInfo = ($_.Group | Where-Object { $_.Severity -eq 1 }).Count
+                  "| $($_.Name) | $($_.Count) | $mPotentialIssues | $mBestPractices | $mInfo |"
+              }) -join "`n"
               
-              Write-Host "  - Errors: $errorCount" -ForegroundColor Red
-              Write-Host "  - Warnings: $warningCount" -ForegroundColor Yellow
-              Write-Host "  - Info: $infoCount" -ForegroundColor Cyan
+              # Sort by severity first (3=Potential Issues, 2=Best Practices, 1=Info), then by count descending
+              $topIssues = ($allResults | Group-Object -Property Name | 
+                  ForEach-Object {
+                      [PSCustomObject]@{
+                          Name = $_.Name
+                          Count = $_.Count
+                          MaxSeverity = ($_.Group | Measure-Object -Property Severity -Maximum).Maximum
+                      }
+                  } | 
+                  Sort-Object @{Expression={$_.MaxSeverity}; Descending=$true}, @{Expression={$_.Count}; Descending=$true} | 
+                  Select-Object -First 5 | 
+                  ForEach-Object {
+                      "| $($_.Name) | $($_.Count) |"
+                  }) -join "`n"
+              
+              @"
+          # 🔍 Power Query Lint Analysis Summary
+          
+          ## 📊 Overview
+          - **Semantic models processed:** $modelsProcessed
+          - **Files analyzed:** $totalFilesAnalyzed
+          - **Total issues found:** $totalIssues
+          - **Analysis date:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC")
+          
+          ## 🚨 Issue Breakdown
+          - 🔴 **Potential Issues:** $potentialIssuesCount
+          - 🟡 **Best Practices:** $bestPracticesCount
+          - 🔵 **Info:** $infoCount
+          
+          ## 📈 Issues by Semantic Model
+          | Model | Total Issues | Potential Issues | Best Practices | Info |
+          |-------|--------------|------------------|----------------|------|
+          $modelBreakdown
+          
+          ## 🔝 Top Issues
+          | Rule Name | Occurrences |
+          |-----------|-------------|
+          $topIssues
+          
+          ## 📄 Detailed Results
+          See the attached artifacts for complete analysis results.
+          
+          ---
+          *Generated by Power Query Lint GitHub Actions Workflow*
+          "@
+          } else {
+              @"
+          # ✅ Power Query Lint Analysis Summary
+          
+          ## 📊 Overview
+          - **Semantic models processed:** $modelsProcessed
+          - **Files analyzed:** $totalFilesAnalyzed
+          - **Total issues found:** 0
+          - **Analysis date:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC")
+          
+          ## 🎉 Results
+          **All TMDL files passed linting checks!** No issues were found.
+          
+          ---
+          *Generated by Power Query Lint GitHub Actions Workflow*
+          "@
           }
           
-          # Export results for artifact publishing
-          if ($allResults.Count -gt 0) {
-              $resultsJson = $allResults | ConvertTo-Json -Depth 10
-              $resultsPath = "pqlint-results.json"
-              $resultsJson | Out-File -FilePath $resultsPath -Encoding UTF8
-              Write-Host "Results exported to: $resultsPath"
-          }
+          $summaryContent | Out-File -FilePath "$summaryDir/summary.md" -Encoding UTF8
           
-          # Fail the workflow if there are errors
-          if ($hasErrors) {
-              Write-Host "❌ Workflow failed due to linting errors" -ForegroundColor Red
+          # Set all outputs
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "total-issues=$totalIssues"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "has-errors=$hasPotentialIssues"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "models-processed=$modelsProcessed"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "files-analyzed=$totalFilesAnalyzed"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "error-count=$potentialIssuesCount"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "warning-count=$bestPracticesCount"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "info-count=$infoCount"
+          if ($hasPotentialIssues) {
+              Write-Host "❌ WORKFLOW FAILED - Critical potential issues found" -ForegroundColor Red
               exit 1
           } else {
-              Write-Host "✅ All TMDL files passed linting checks" -ForegroundColor Green
+              Write-Host "✅ WORKFLOW PASSED - Analysis complete" -ForegroundColor Green
           }
 
-      - name: Upload PQLint Results
+      # Best Practice: Always upload artifacts, even on failure
+      - name: Upload Power Query Lint Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pqlint-results
-          path: pqlint-results.json
+          name: pqlint-results-${{ github.run_id }}
+          path: pqlint-results/
+          # Best Practice: Set retention period
+          retention-days: 30
+          # Best Practice: Add compression
+          compression-level: 6
+
+      # Best Practice: Add job summary
+      - name: Add Job Summary
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path "pqlint-results/summary.md") {
+              Get-Content "pqlint-results/summary.md" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+          }
+
+  # Best Practice: Add a separate job for notifications (optional)
+  notify-results:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: tmdl-linting
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          name: pqlint-results-${{ github.run_id }}
+          path: results/
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'results/summary.md';
+            
+            if (fs.existsSync(path)) {
+              const summary = fs.readFileSync(path, 'utf8');
+              const status = '${{ needs.tmdl-linting.outputs.has-errors }}' === 'true' ? '❌ Failed' : '✅ Passed';
+              const totalIssues = '${{ needs.tmdl-linting.outputs.total-issues }}';
+              const modelsProcessed = '${{ needs.tmdl-linting.outputs.models-processed }}';
+              const filesAnalyzed = '${{ needs.tmdl-linting.outputs.files-analyzed }}';
+              const potentialIssues = '${{ needs.tmdl-linting.outputs.error-count }}';
+              const bestPractices = '${{ needs.tmdl-linting.outputs.warning-count }}';
+              const info = '${{ needs.tmdl-linting.outputs.info-count }}';
+
+              const header = `## 🔍 Power Query Lint Analysis Results - ${status}\n\n` +
+                           `**Quick Stats:** ${totalIssues} issues found across ${filesAnalyzed} files in ${modelsProcessed} semantic models\n` +
+                           `- 🔴 Potential Issues: ${potentialIssues}\n` +
+                           `- 🟡 Best Practices: ${bestPractices}\n` +
+                           `- 🔵 Info: ${info}\n\n`;
+              
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: header + summary
+              });
+            }
