@@ -33,7 +33,7 @@ table AlignmentDim
 				let
 				    Source = MarvelSource,
 				    #"Removed Other Columns" = Table.SelectColumns(Source,{"ALIGN"}),
-				    #"Removed Duplicates" = Table.Distinct(#"Removed Other Columns"),
+				    #"Removed Duplicates" = Table.Buffer(Table.Distinct(#"Removed Other Columns")),
 				    #"Duplicated Column" = Table.DuplicateColumn(#"Removed Duplicates", "ALIGN", "ALIGN - Copy"),
 				    #"Renamed Columns" = Table.RenameColumns(#"Duplicated Column",{{"ALIGN - Copy", "AlignmentKey"}}),
 				    #"Split Column by Delimiter" = Table.SplitColumn(#"Renamed Columns", "ALIGN", Splitter.SplitTextByDelimiter(" ", QuoteStyle.Csv), {"ALIGN.1", "ALIGN.2"}),
@@ -46,7 +46,7 @@ table AlignmentDim
 				    #"Reordered Columns" = Table.ReorderColumns(#"Renamed Columns2",{"AlignmentID", "Alignment", "ALIGN.2", "AlignmentKey"}),
 				    #"Removed Columns" = Table.RemoveColumns(#"Reordered Columns",{"ALIGN.2"}),
 				    #"Renamed Columns3" = Table.RenameColumns(#"Removed Columns",{{"AlignmentKey", "AlignmentKey"}}),
-				    #"Sorted Rows1" = Table.Sort(#"Renamed Columns3",{{"AlignmentKey", Order.Ascending}})
+				    #"Sorted Rows1" = Table.Buffer(Table.Sort(#"Renamed Columns3",{{"AlignmentKey", Order.Ascending}}))
 				in
 				    #"Sorted Rows1"
 
